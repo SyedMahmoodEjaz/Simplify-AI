@@ -7,6 +7,7 @@ import html
 import io
 import json
 import os
+import base64
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +36,8 @@ def stored_api_key() -> str:
 
 MAX_CHARS = 12000
 MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b"]
+VISION_MODELS = ["qwen/qwen3.6-27b", "qwen/qwen3.8-27b"]
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 
 # name -> (label shown on the tab, right-to-left script?)
 LANGUAGES = {
@@ -268,6 +271,14 @@ section[data-testid="stSidebar"] button[kind="secondary"]:hover {
   .sai-sky, .sai-intro { display:none; }
 }
 
+.sai-warnbar {
+  background:rgba(242,115,95,.10); border:1px solid rgba(242,115,95,.45);
+  border-left:3px solid var(--rose); border-radius:4px;
+  padding:.95rem 1.15rem; color:var(--text); font-size:.93rem; line-height:1.6;
+  margin:.4rem 0 .2rem;
+}
+.sai-warnbar b { color:var(--rose); }
+
 /* ---------- mobile ---------- */
 @media (max-width:760px) {
   .block-container { padding:1rem .85rem 3rem!important; }
@@ -403,7 +414,7 @@ def ocr_pdf(data: bytes, lang: str, dpi: int = 300) -> str:
 
 def extract_text(uploaded_file, ocr_lang: str = "eng+urd") -> tuple:
     name = uploaded_file.name.lower()
-    data = uploaded_file.read()
+    data = uploaded_file.getvalue()
 
     if name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")):
         from PIL import Image
@@ -496,6 +507,81 @@ def simplify(text: str, api_key: str, model: str, language: str = "Urdu") -> dic
     result = json.loads(response.choices[0].message.content)
     result["language"] = language
     result["translated_rtl"] = LANGUAGES.get(language, ("", True))[1]
+    return result
+
+
+VISION_EXTRA = """
+
+You are reading a PHOTOGRAPH of the document, not typed text. Much of it may be handwritten.
+
+Handwriting rules — these matter more than being helpful:
+- NEVER guess a medicine name, a dose, a number, a date or an amount. A wrong medicine name or \
+dose can seriously hurt someone.
+- If you cannot read something with confidence, do not put a guess in the main content. Put what \
+you think it might say in "unclear" instead, and describe the uncertainty.
+- If handwriting is partly readable, write what you can actually see, and mark the rest unclear.
+- Say plainly in "what_this_means" if the handwritten part could not be read reliably.
+
+Also include these two extra keys in the JSON:
+  "transcription": "everything you can read from the image, printed and handwritten, laid out \
+roughly as it appears",
+  "unclear": ["each item you could not read confidently, with your best guess marked as a guess"]
+"""
+
+
+def prepare_image(data: bytes, max_side: int = 1600) -> str:
+    """Downscale and re-encode so the request stays well under Groq's 20MB limit."""
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(data))
+    if image.mode not in ("RGB", "L"):
+        image = image.convert("RGB")
+    if max(image.size) > max_side:
+        ratio = max_side / max(image.size)
+        image = image.resize((int(image.width * ratio), int(image.height * ratio)))
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=88)
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+def pdf_to_images(data: bytes, limit: int = 3) -> list:
+    import fitz
+
+    pages = []
+    with fitz.open(stream=data, filetype="pdf") as doc:
+        for page in list(doc)[:limit]:
+            pages.append(page.get_pixmap(dpi=200).tobytes("png"))
+    return pages
+
+
+def simplify_image(images: list, api_key: str, model: str, language: str = "Urdu") -> dict:
+    """Send the picture itself to a vision model instead of OCR'ing it first."""
+    from groq import Groq
+
+    content = [{"type": "text",
+                "text": "Read this document image and return the JSON described in your "
+                        "instructions."}]
+    for raw in images[:3]:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{prepare_image(raw)}"},
+        })
+
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model=model,
+        temperature=0.1,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system",
+             "content": SYSTEM_PROMPT.format(language=language) + VISION_EXTRA},
+            {"role": "user", "content": content},
+        ],
+    )
+    result = json.loads(response.choices[0].message.content)
+    result["language"] = language
+    result["translated_rtl"] = LANGUAGES.get(language, ("", True))[1]
+    result["source_mode"] = "vision"
     return result
 
 
@@ -772,6 +858,7 @@ with st.sidebar:
             api_key = st.text_input("Groq API key", type="password",
                                     help="Or put GROQ_API_KEY=... in a .env file next to app.py")
         model = st.selectbox("Model", MODELS)
+        vision_model = st.selectbox("Vision model (handwriting)", VISION_MODELS)
         ocr_lang = st.selectbox("OCR language", ["eng+urd", "eng", "urd"])
         st.text_input("Tesseract path (Windows only)", key="tesseract_path",
                       value=os.environ.get("TESSERACT_CMD", ""),
@@ -825,31 +912,53 @@ st.write("")
 
 if "result" not in st.session_state:
     document_text = ""
+    vision_images = []
     tab_upload, tab_paste = st.tabs(["Upload a file", "Paste text"])
 
     with tab_upload:
         uploaded = st.file_uploader(
             "PDF, DOCX, TXT — or a photo/scan",
-            type=["pdf", "docx", "txt", "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"],
+            type=["pdf", "docx", "txt", *[e.lstrip(".") for e in IMAGE_EXTS]],
         )
         if uploaded:
-            try:
-                with st.spinner("Reading the document..."):
-                    document_text, how = extract_text(uploaded, ocr_lang)
-                if document_text:
-                    st.success(f"Read {len(document_text):,} characters via {how}.")
-                    with st.expander("Preview extracted text"):
-                        st.text(document_text[:3000])
-                else:
-                    st.warning("No readable text found. Try a clearer scan, or paste the text.")
-            except RuntimeError as exc:
-                if str(exc) == "TESSERACT_MISSING":
-                    st.error("This file is a scan and needs OCR, but Tesseract was not found. "
-                             "Install it, then set the path under Settings.")
-                else:
+            name = uploaded.name.lower()
+            can_see = name.endswith(IMAGE_EXTS) or name.endswith(".pdf")
+            mode = "Printed text"
+            if can_see:
+                mode = st.radio(
+                    "How should I read this?",
+                    ["Printed text", "Handwritten (AI vision)"],
+                    horizontal=True,
+                    help="Printed text uses OCR, which is accurate but cannot read handwriting. "
+                         "AI vision can attempt handwriting, but may misread it.",
+                )
+
+            if mode.startswith("Handwritten"):
+                raw = uploaded.getvalue()
+                vision_images = pdf_to_images(raw) if name.endswith(".pdf") else [raw]
+                st.image(raw if not name.endswith(".pdf") else vision_images[0],
+                         caption="This image will be read by the AI directly", width=320)
+                st.warning("AI vision can misread handwriting. Always check the result against "
+                           "the original — especially medicine names, doses and dates.")
+            else:
+                try:
+                    with st.spinner("Reading the document..."):
+                        document_text, how = extract_text(uploaded, ocr_lang)
+                    if document_text:
+                        st.success(f"Read {len(document_text):,} characters via {how}.")
+                        with st.expander("Preview extracted text"):
+                            st.text(document_text[:3000])
+                    else:
+                        st.warning("No readable text found. If it is handwritten, switch to "
+                                   "'Handwritten (AI vision)' above.")
+                except RuntimeError as exc:
+                    if str(exc) == "TESSERACT_MISSING":
+                        st.error("This file is a scan and needs OCR, but Tesseract was not found. "
+                                 "Install it, or switch to 'Handwritten (AI vision)' above.")
+                    else:
+                        st.error(f"Could not read the file: {exc}")
+                except Exception as exc:
                     st.error(f"Could not read the file: {exc}")
-            except Exception as exc:
-                st.error(f"Could not read the file: {exc}")
 
     with tab_paste:
         pasted = st.text_area("Paste the notice, policy or instructions",
@@ -869,14 +978,18 @@ if "result" not in st.session_state:
     if go:
         if not api_key:
             st.error("Add your Groq API key under Settings in the sidebar.")
-        elif not document_text:
+        elif not document_text and not vision_images:
             st.error("Upload a file or paste some text first.")
         else:
-            if len(document_text) > MAX_CHARS:
-                st.info(f"Long document — using the first {MAX_CHARS:,} characters.")
             try:
-                with st.spinner(f"Reading and simplifying into English and {language}..."):
-                    result = simplify(document_text, api_key, model, language)
+                if vision_images:
+                    with st.spinner(f"Looking at the image and writing English and {language}..."):
+                        result = simplify_image(vision_images, api_key, vision_model, language)
+                else:
+                    if len(document_text) > MAX_CHARS:
+                        st.info(f"Long document — using the first {MAX_CHARS:,} characters.")
+                    with st.spinner(f"Reading and simplifying into English and {language}..."):
+                        result = simplify(document_text, api_key, model, language)
                 record = save_record(result, uploaded.name if uploaded else "pasted text")
                 st.session_state["result"] = result
                 st.session_state["current_id"] = record["id"]
@@ -891,6 +1004,24 @@ else:
         f'margin:.2rem 0 1.2rem;color:#E7E9EE;">{html.escape(result.get("title", ""))}</h2>',
         unsafe_allow_html=True,
     )
+
+    if result.get("source_mode") == "vision":
+        st.markdown(
+            '<div class="sai-warnbar"><b>Read from an image by AI.</b> Handwriting can be '
+            'misread. Check every medicine name, dose, number and date against the original '
+            'document before acting on it.</div>',
+            unsafe_allow_html=True,
+        )
+        unclear = [u for u in (result.get("unclear") or []) if str(u).strip()]
+        if unclear:
+            st.markdown('<div class="eyebrow" style="margin:.9rem 0 .3rem">'
+                        'Could not be read confidently</div>', unsafe_allow_html=True)
+            for item in unclear:
+                st.markdown(f"- {item}")
+        if result.get("transcription"):
+            with st.expander("What the AI saw in the image"):
+                st.text(result["transcription"])
+        st.write("")
 
     language = result.get("language", "Urdu")
     tab_label = LANGUAGES.get(language, (language, True))[0]
