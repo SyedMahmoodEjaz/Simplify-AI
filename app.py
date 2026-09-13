@@ -628,23 +628,34 @@ def as_plain_text(result: dict) -> str:
 
 
 # ---------------------------------------------------------------- PDF export
-FONT_PATHS = [
-    Path(r"C:\Windows\Fonts\tahoma.ttf"),
-    Path(r"C:\Windows\Fonts\arial.ttf"),
-    Path("/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf"),
-    Path("/Library/Fonts/Arial Unicode.ttf"),
+FONT_DIRS = [
+    Path("fonts"),
+    Path("/usr/share/fonts"),
+    Path(r"C:\Windows\Fonts"),
+    Path("/Library/Fonts"),
+    Path("/System/Library/Fonts"),
 ]
+FONT_NAMES = ["notonaskharabic", "notonastaliq", "jameel", "tahoma", "arial unicode", "arial"]
 
 
 def unicode_font():
-    """Any TTF that can draw Arabic script. Drop one in a 'fonts' folder to override."""
-    folder = Path("fonts")
-    if folder.is_dir():
-        for candidate in sorted(folder.glob("*.ttf")):
+    """Any TTF that can draw Arabic script. A .ttf in a local 'fonts' folder wins."""
+    local = Path("fonts")
+    if local.is_dir():
+        for candidate in sorted(local.glob("*.ttf")):
             return candidate
-    for path in FONT_PATHS:
-        if path.is_file():
-            return path
+
+    for directory in FONT_DIRS[1:]:
+        if not directory.is_dir():
+            continue
+        try:
+            files = list(directory.rglob("*.ttf"))
+        except OSError:
+            continue
+        for wanted in FONT_NAMES:
+            for path in files:
+                if wanted in path.name.lower().replace("-", "").replace("_", ""):
+                    return path
     return None
 
 
@@ -902,5 +913,5 @@ else:
                                file_name=f"{slug}.pdf", mime="application/pdf",
                                use_container_width=True)
         except Exception as exc:
-            st.button("PDF unavailable", disabled=True, use_container_width=True,
-                      help=str(exc))
+            st.button("PDF failed", disabled=True, use_container_width=True)
+            st.caption(f"PDF error: {exc}")
