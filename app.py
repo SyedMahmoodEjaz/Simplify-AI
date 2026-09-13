@@ -554,13 +554,28 @@ def pdf_to_images(data: bytes, limit: int = 3) -> list:
     return pages
 
 
+def extract_json(text: str) -> dict:
+    """Parse JSON even when the model wraps it in prose or code fences."""
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = text.split("```")[1].lstrip("json").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end <= start:
+            raise ValueError("The model did not return readable JSON. Try again, or use a "
+                             "clearer photo.")
+        return json.loads(text[start:end + 1])
+
+
 def simplify_image(images: list, api_key: str, model: str, language: str = "Urdu") -> dict:
     """Send the picture itself to a vision model instead of OCR'ing it first."""
     from groq import Groq
 
     content = [{"type": "text",
                 "text": "Read this document image and return the JSON described in your "
-                        "instructions."}]
+                        "instructions. Output the JSON object only."}]
     for raw in images[:3]:
         content.append({
             "type": "image_url",
@@ -568,17 +583,34 @@ def simplify_image(images: list, api_key: str, model: str, language: str = "Urdu
         })
 
     client = Groq(api_key=api_key)
-    response = client.chat.completions.create(
-        model=model,
-        temperature=0.1,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system",
-             "content": SYSTEM_PROMPT.format(language=language) + VISION_EXTRA},
-            {"role": "user", "content": content},
-        ],
-    )
-    result = json.loads(response.choices[0].message.content)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT.format(language=language) + VISION_EXTRA},
+        {"role": "user", "content": content},
+    ]
+    base = dict(model=model, temperature=0.1, messages=messages,
+                max_completion_tokens=8000)
+
+    # Qwen is a thinking model: its reasoning can crowd out the JSON, so turn it down
+    # first, and fall back through looser settings if the server rejects an option.
+    attempts = [
+        dict(base, reasoning_effort="none", response_format={"type": "json_object"}),
+        dict(base, response_format={"type": "json_object"}),
+        dict(base, reasoning_effort="none"),
+        base,
+    ]
+
+    last_error = None
+    for options in attempts:
+        try:
+            response = client.chat.completions.create(**options)
+            result = extract_json(response.choices[0].message.content)
+            if result:
+                break
+        except Exception as exc:
+            last_error = exc
+    else:
+        raise last_error or ValueError("The vision model could not read this image.")
+
     result["language"] = language
     result["translated_rtl"] = LANGUAGES.get(language, ("", True))[1]
     result["source_mode"] = "vision"
